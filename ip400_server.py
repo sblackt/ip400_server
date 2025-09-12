@@ -103,57 +103,7 @@ def decode_excess40_callsign(call_bytes: bytes) -> str:
         # The characters are extracted from right-to-left, so we reverse them.
         callsign = "".join(reversed(decoded_chars)).strip()
 
-        # The protocol image shows VA3WAV as 186E01C5
-        # 186E01C5 (hex) = 408104840 (dec)
-        # Using this logic on 408104840 with your char_map:
-        # 408104840 % 40 = 0 -> '0'
-        # (408104840//40)%40 = 10202621 % 40 = 21 -> 'K'
-        # (10202621//40)%40 = 255065 % 40 = 25 -> 'O'
-        # (255065//40)%40 = 6376 % 40 = 16 -> 'F'
-        # (6376//40)%40 = 159 % 40 = 39 -> '@'
-        # (159//40)%40 = 3 % 40 = 3 -> '3'
-        # Result: "3@FKO0" - this is not VA3WAV.
-        
-        # This indicates that either:
-        # 1. The sample data is wrong.
-        # 2. The character map is different.
-        # 3. The endianness is wrong, but both little and big endian produce gibberish.
-        # 4. The encoding is not a simple base-40 conversion.
-        
-        # Given your code's output, it seems to be processing a different byte order or value.
-        # The output '40444_:61140' suggests an issue with endianness or a different callsign.
-        
-        # Re-try the callsign VA3WAV (using big-endian)
-        # V=32, A=11, 3=3, W=33, A=11, V=32
-        # val = 32*40^5 + 11*40^4 + 3*40^3 + 33*40^2 + 11*40^1 + 32*40^0
-        # This results in a number much larger than 32-bits can hold.
-        # Let's assume the callsign is V A 3 W A V -> 32 11 3 33 11 32
-        # F = (32) + (11 * 40) + (3 * 40^2) + (33 * 40^3) + (11 * 40^4) + (32 * 40^5)
-        # This number is 331,642,302,528, which is too large.
-        
-        # The encoding must be:
-        # F = (V) + (A*40) + (3*40^2) + (W*40^3) + (A*40^4) + (V*40^5)
-        # F = 32 + 11*40 + 3*1600 + 33*64000 + 11*2560000 + 32*102400000
-        # F = 32 + 440 + 4800 + 2112000 + 28160000 + 3276800000
-        # F = 3,307,105,272 (dec)
-        # 3,307,105,272 (dec) = C5016E18 (hex)
-        # This matches the little-endian bytes of the original hex string!
-        
-        # This is the correct logic. The callsign is stored from right to left (LSB to MSB)
-        # and the hex value `186e01c5` is the big-endian representation.
-        # However, the decimal value is built from the LSB.
-
-        # The issue is that your code decodes the **callsign** as if it's stored from LSB to MSB.
-        # But the **bytes** are stored from MSB to LSB.
-        # The correct byte order for the hex string 186e01c5 is c5 01 6e 18.
-        # The `struct.unpack('>I', ...)` correctly handles the byte order for the integer,
-        # but the integer value it produces is `408104840`, which comes from `186e01c5`.
-        # The integer we need is `3307105272`, which comes from `c5016e18`.
-        
-        # The callsign is encoded **right to left**.
-        # The raw data is **big-endian**.
-        # To get the right integer, you must read it as a little-endian value.
-        
+       
         value = struct.unpack('<I', call_bytes)[0]
         # value is now 3307105272
 
