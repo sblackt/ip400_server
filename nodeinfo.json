@@ -1,0 +1,17 @@
+{
+  "Station Callsign": "VA3WAV",
+  "Latitude": "45.509",
+  "Longitude": "-77.191",
+  "Grid Square": "FN15",
+  "Capabilities": "FSK",
+  "Beacon Interval": "1 mins",
+  "RF Frequency": "445.750 MHz",
+  "Modulation method": "4FSK",
+  "Data Rate": "100.0 Kbps",
+  "Peak Deviation": "25.0 KHz",
+  "Channel Filter Bandwidth": "200.0 KHz",
+  "Output Power": "14 dBm",
+  "PA Mode": "HP 14dBm Max",
+  "Rx Squelch": "-95",
+  "Hit enter to continue": "\u001b[2J\u001b[H      IP400 Pi Zero HAT menu"
+}

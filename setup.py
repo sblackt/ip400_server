@@ -26,6 +26,7 @@ setup(
     python_requires='>=3.7',
     install_requires=[
         'flask>=2.0.0',
+        'pyserial>=3.5',
     ],
     include_package_data=True,
 )

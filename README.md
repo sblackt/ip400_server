@@ -2,71 +2,78 @@
 <img width="1277" height="687" alt="ip400_server" src="https://github.com/user-attachments/assets/594d18ea-86df-41b5-bb30-221d75214726" />
 # IP400 Server
 
-A server for processing and displaying APRS and other radio packet data from IP400 devices.
+This project hosts the Pi Zero 2 W gateway for an IP400 RF mesh node.  
+It listens to the UDP feed produced by the IP400 hat, manages the serial-based
+chat/console interface, and exposes a responsive Flask UI for live monitoring.
 
-## Features
+## Highlights
 
-- UDP packet listener for IP400 protocol
-- Web-based interface for real-time monitoring
-- JSON API for integration with other applications
-- Support for GPS coordinates and APRS data
+- **UDP ingest** of native IP4C frames with beacon parsing, location extraction,
+  and per-node history.
+- **Dual serial workers**: dedicated chat loop and on-demand console loop that
+  coordinate access to the single UART.
+- **Interactive web dashboard** featuring a Leaflet map, active node list,
+  chat panel, and a console modal that mirrors the device menu.
+- **REST API** (`/api/frames`, `/api/nodes`, `/api/chat`, `/api/console/*`,
+  `/api/nodeinfo`, `/api/mode`, `/api/server/restart`) backing the UI and
+  available for integrations.
+- **Node info caching** from Menu A (station parameters) with optional refresh
+  on demand.
 
-## Installation
+## Requirements
 
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/yourusername/ip400-server.git
-   cd ip400-server
-   ```
+- Python 3.9+
+- `pip install -r requirements.txt` (includes Flask and pyserial)
+- IP400 Pi Zero hat attached to `/dev/serial0` (default; configurable via env)
 
-2. Install the package:
-   ```bash
-   pip install -e .
-   ```
-   
-   Or for system-wide installation:
-   ```bash
-   pip install .
-   ```
+## Configuration
 
-## Usage
+Environment variables:
 
-### Starting the Server
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `IP400_CHAT_PORT` | `/dev/serial0` | Serial device used for chat/console |
+| `IP400_CHAT_BAUD` | `115200` | Baud rate for serial communication |
+| `IP400_UDP_IP` | `0.0.0.0` | Bind address for UDP listener |
+| `IP400_UDP_PORT` | `9000` | UDP port for inbound IP4C frames |
+| `IP400_WEB_HOST` | `0.0.0.0` | Flask web host |
+| `IP400_WEB_PORT` | `5000` | Flask web port |
+
+## Running
 
 ```bash
-ip400-server
+cd ip400_server
+python3 ip400_server.py
 ```
 
-By default, the server will:
-- Listen on UDP port 9000 for incoming packets
-- Start a web interface on http://localhost:5000
+On startup the server:
 
-### Configuration
+1. Reads node parameters via menu **A** and caches them to `/tmp/ip400_node.json`.
+2. Launches three daemon threads: UDP listener, chat loop, console loop.
+3. Serves the Flask UI/API at `http://<web-host>:<web-port>`.
 
-You can configure the server using environment variables:
+### Console & Chat Coordination
 
-- `IP400_UDP_IP`: IP address to bind the UDP listener (default: 0.0.0.0)
-- `IP400_UDP_PORT`: UDP port to listen on (default: 9000)
-- `IP400_WEB_HOST`: Web interface host (default: 0.0.0.0)
-- `IP400_WEB_PORT`: Web interface port (default: 5000)
+- Opening the **Settings** modal on the web UI calls `/api/mode` to pause the
+  chat thread and give exclusive serial access to the console loop.
+- Closing the modal sends the device back to chat mode and resumes the chat
+  thread automatically.
 
-## API Endpoints
+### Web UI Tips
 
-- `GET /api/frames` - Get recent frames
-- `GET /api/nodes` - Get node information
+- **Map**: displays live nodes with custom markers; local node renders in red.
+- **Active Nodes**: shows last seen, distance, RSSI, and packet counts.
+- **Chat**: select a node (or broadcast) to send messages via the serial loop.
+- **Console**: available in the Settings modal. Commands are serialized through
+  the console worker and responses stream into the terminal view.
 
-## Development
+## Development Notes
 
-1. Create a virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-   ```
-
-2. Install development dependencies:
-   ```bash
-   pip install -e ".[dev]"
-   ```
+- `pyproject.toml` and `setup.py` are present for legacy setuptools support.
+- When editing the frontend, remember the HTML/JS is embedded directly within
+  `ip400_server.py`.
+- The server writes node info to `nodeinfo.json` (local cache) and optionally
+  to `/tmp/ip400_node.json` for other services.
 
 ## License
 
