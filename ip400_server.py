@@ -9,7 +9,7 @@ from datetime import datetime
 from collections import deque, defaultdict
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, render_template_string, jsonify, request, send_from_directory
 
 # New imports for serial/chat
 try:
@@ -19,6 +19,11 @@ except Exception:
     serial = None
 from queue import Queue
 import signal
+
+from photo_manager import PhotoManager
+from photo_sender import send_photo_bytes, PhotoSendError, parse_resize
+from local_command_manager import LocalCommandManager, LocalCommandTimeout
+from ip4c_utils import CODING_LOCAL_COMMAND
 
 # Flask setup
 app = Flask(__name__)
@@ -33,6 +38,14 @@ CHAT_PORT = os.getenv("IP400_CHAT_PORT", "/dev/serial0")
 CHAT_BAUD = int(os.getenv("IP400_CHAT_BAUD", "115200"))
 CHAT_MAX_HISTORY = 500
 
+# Photo transmission configuration
+PHOTO_SPI_HOST = os.getenv("IP400_SPI_HOST", "127.0.0.1")
+PHOTO_SPI_PORT = int(os.getenv("IP400_SPI_PORT", "8400"))
+PHOTO_DEFAULT_FROM_PORT = int(os.getenv("IP400_FROM_PORT", "100"))
+PHOTO_DEFAULT_TO_PORT = int(os.getenv("IP400_TO_PORT", "100"))
+PHOTO_MAX_PAYLOAD = int(os.getenv("IP400_PHOTO_MAX_PAYLOAD", "900"))
+PHOTO_DELAY = float(os.getenv("IP400_PHOTO_DELAY", "0.3"))
+
 # Data structures
 frame_history = deque(maxlen=MAX_HISTORY)
 node_history = defaultdict(dict)  # node_id -> {last_seen, rssi, location, etc.}
@@ -41,6 +54,10 @@ node_history = defaultdict(dict)  # node_id -> {last_seen, rssi, location, etc.}
 chat_history = defaultdict(lambda: deque(maxlen=CHAT_MAX_HISTORY))  # node_id -> deque of messages
 chat_outgoing = Queue()
 recent_sent_messages = deque(maxlen=10)  # Track recently sent messages for echo suppression
+
+# Photo storage
+photo_manager = PhotoManager(storage_dir="photos", history=12)
+local_command_manager: Optional[LocalCommandManager] = None
 
 # Thread coordination flags
 chat_should_run = threading.Event()
@@ -404,6 +421,28 @@ def read_ip400_node_info():
     
     return info
 
+
+def get_local_callsign(default: str = "N0CALL") -> str:
+    """Best-effort lookup of the local station callsign."""
+    candidates = [
+        node_info.get("Station Callsign") if isinstance(node_info, dict) else None,
+        node_info_cache.get("Station Callsign") if isinstance(node_info_cache, dict) else None,
+        os.getenv("IP400_LOCAL_CALLSIGN"),
+    ]
+    for value in candidates:
+        if value:
+            return str(value).strip() or default
+    return default
+
+
+local_command_manager = LocalCommandManager(
+    spi_host=PHOTO_SPI_HOST,
+    spi_port=PHOTO_SPI_PORT,
+    callsign_provider=get_local_callsign,
+    from_port=PHOTO_DEFAULT_FROM_PORT,
+    to_port=PHOTO_DEFAULT_TO_PORT,
+)
+
 # ---------------------------
 # UDP listener
 # ---------------------------
@@ -418,6 +457,10 @@ def udp_listener():
             data, addr = sock.recvfrom(4096)
             beacon = parse_ip400_frame(data)
             if beacon:
+                if (beacon.coding & 0x0F) == CODING_LOCAL_COMMAND:
+                    if beacon.payload:
+                        local_command_manager.handle_response(beacon.payload)
+                    continue
                 frame_history.appendleft(beacon)
                 node_id = f"{beacon.from_call}:{beacon.from_port}"
                 node_history[node_id] = {
@@ -429,6 +472,13 @@ def udp_listener():
                     'packet_type': get_packet_type_name(beacon.coding),
                     # optionally mark local if matches configured callsign (not set here)
                 }
+                try:
+                    if (beacon.coding & 0x0F) == 0x03 and beacon.payload:
+                        photo_info = photo_manager.handle_frame(beacon.from_call or "UNKNOWN", beacon.payload)
+                        if photo_info:
+                            print(f"[PHOTO] New image available: {photo_info['original_name']} ({photo_info['size']} bytes)")
+                except Exception as exc:
+                    print(f"[PHOTO] Error handling data frame: {exc}")
             else:
                 # Not an IP4C frame; ignore
                 pass
@@ -936,34 +986,73 @@ def index():
             </div>
           </div>
         </div>
-      </div>
-    </div>
-
-    <div class="row">
-      <div class="col-12">
-        <div class="card">
-          <div class="card-header d-flex justify-content-between align-items-center">
-            <h5 class="mb-0">Recent Frames</h5>
-            <div>
-              <input type="text" id="searchInput" class="form-control form-control-sm" placeholder="Search...">
-            </div>
+        <div class="card mb-4">
+          <div class="card-header">
+            <h5 class="mb-0">Photo Transfer</h5>
           </div>
-          <div class="table-responsive">
-            <table class="table table-sm table-hover mb-0">
-              <thead class="table-light">
-                <tr>
-                  <th>Time</th>
-                  <th>From</th>
-                  <th>To</th>
-                  <th>Type</th>
-                  <th>Hops</th>
-                  <th>Flags</th>
-                  <th>Size</th>
-                </tr>
-              </thead>
-              <tbody id="frameTable">
-              </tbody>
-            </table>
+          <div class="card-body">
+            <form id="photoUploadForm" enctype="multipart/form-data">
+              <div class="mb-2">
+                <label class="form-label small text-muted">Select Photo</label>
+                <input type="file" class="form-control form-control-sm" id="photoFile" name="photo" accept="image/*" required>
+              </div>
+              <div class="mb-2">
+                <label class="form-label small text-muted">From Callsign</label>
+                <input type="text" class="form-control form-control-sm" id="photoFromCall" name="fromCall" placeholder="Local call" value="">
+              </div>
+              <div class="mb-2">
+                <label class="form-label small text-muted">Destination Callsign</label>
+                <input type="text" class="form-control form-control-sm" id="photoToCall" name="toCall" value="BROADCAST" required>
+              </div>
+              <div class="accordion mt-3" id="photoAdvancedOptions">
+                <div class="accordion-item">
+                  <h2 class="accordion-header" id="photoAdvancedHeading">
+                    <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse" data-bs-target="#photoAdvancedCollapse" aria-expanded="false" aria-controls="photoAdvancedCollapse">
+                      Advanced Options
+                    </button>
+                  </h2>
+                  <div id="photoAdvancedCollapse" class="accordion-collapse collapse" aria-labelledby="photoAdvancedHeading" data-bs-parent="#photoAdvancedOptions">
+                    <div class="accordion-body">
+                      <div class="row g-2">
+                        <div class="col">
+                          <label class="form-label small text-muted">Destination Port</label>
+                          <input type="number" class="form-control form-control-sm" id="photoToPort" name="toPort" value="100">
+                        </div>
+                        <div class="col">
+                          <label class="form-label small text-muted">Max Payload</label>
+                          <input type="number" class="form-control form-control-sm" id="photoMaxPayload" name="maxPayload" value="900">
+                        </div>
+                      </div>
+                      <div class="row g-2 mt-2">
+                        <div class="col">
+                          <label class="form-label small text-muted">Delay (s)</label>
+                          <input type="number" step="0.1" class="form-control form-control-sm" id="photoDelay" name="delay" value="0.3">
+                        </div>
+                        <div class="col">
+                          <label class="form-label small text-muted">Resize (WxH)</label>
+                          <input type="text" class="form-control form-control-sm" id="photoResize" name="resize" placeholder="e.g. 320x240">
+                        </div>
+                      </div>
+                      <div class="form-check form-switch mt-2">
+                        <input class="form-check-input" type="checkbox" id="photoRepeatable" name="repeatable">
+                        <label class="form-check-label small text-muted" for="photoRepeatable">Enable mesh repeat (hop propagation)</label>
+                      </div>
+                      <div class="form-check form-switch mt-1">
+                        <input class="form-check-input" type="checkbox" id="photoConnectionless" name="connectionless" checked>
+                        <label class="form-check-label small text-muted" for="photoConnectionless">Connectionless packet</label>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <button type="submit" class="btn btn-sm btn-primary w-100 mt-3">
+                <i class="bi bi-upload"></i> Send Photo
+              </button>
+            </form>
+            <div id="photoUploadStatus" class="alert alert-secondary small d-none mt-3" role="alert"></div>
+          </div>
+          <div class="list-group list-group-flush" id="photoList">
+            <div class="list-group-item text-muted small">No photos received yet</div>
           </div>
         </div>
       </div>
@@ -991,6 +1080,47 @@ def index():
           <div class="card-footer d-flex">
             <input id="chatInput" class="form-control me-2" placeholder="Type message..." disabled>
             <button class="btn btn-primary" id="chatSend" disabled>Send</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Frame history -->
+    <div class="row mt-3">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <div class="d-flex align-items-center">
+              <button class="btn btn-sm btn-outline-secondary me-2" type="button"
+                      title="Toggle frame history" aria-label="Toggle frame history"
+                      data-bs-toggle="collapse" data-bs-target="#frameCollapse"
+                      aria-expanded="true" aria-controls="frameCollapse">
+                <i class="bi bi-chevron-up" id="frameCollapseIcon"></i>
+              </button>
+              <h5 class="mb-0">Recent Frames</h5>
+            </div>
+            <div>
+              <input type="text" id="searchInput" class="form-control form-control-sm" placeholder="Search...">
+            </div>
+          </div>
+          <div id="frameCollapse" class="collapse show">
+            <div class="table-responsive">
+              <table class="table table-sm table-hover mb-0">
+                <thead class="table-light">
+                  <tr>
+                    <th>Time</th>
+                    <th>From</th>
+                    <th>To</th>
+                    <th>Type</th>
+                    <th>Hops</th>
+                    <th>Flags</th>
+                    <th>Size</th>
+                  </tr>
+                </thead>
+                <tbody id="frameTable">
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       </div>
@@ -1054,6 +1184,41 @@ def index():
               </div>
             </div>
             <div class="col-md-9">
+              <div class="mb-4">
+                <div class="d-flex justify-content-between align-items-center">
+                  <h6 class="mb-0">Node Settings</h6>
+                  <div>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" onclick="refreshNodeSettings()">
+                      <i class="bi bi-arrow-repeat"></i> Refresh
+                    </button>
+                    <button type="button" class="btn btn-sm btn-primary ms-2" id="nodeSettingsSaveBtn" onclick="saveNodeSettings()">
+                      <i class="bi bi-save"></i> Save
+                    </button>
+                  </div>
+                </div>
+                <div id="nodeSettingsStatus" class="alert alert-secondary small d-none mt-2" role="alert"></div>
+                <div class="row g-3 mt-1">
+                  <div class="col-md-6">
+                    <label class="form-label small text-muted">Station Callsign</label>
+                    <input type="text" class="form-control form-control-sm" id="settingStationCallsign" data-setting-key="Station Callsign">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small text-muted">Beacon Interval (mins)</label>
+                    <input type="text" class="form-control form-control-sm" id="settingBeaconInterval" data-setting-key="Beacon Interval">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small text-muted">RF Frequency (MHz)</label>
+                    <input type="text" class="form-control form-control-sm" id="settingRfFrequency" data-setting-key="RF Frequency">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small text-muted">Output Power</label>
+                    <input type="text" class="form-control form-control-sm" id="settingOutputPower" data-setting-key="Output Power">
+                  </div>
+                </div>
+                <small class="text-muted d-block mt-2">
+                  Changes are queued for the hat; ensure the pending settings file is processed by the control service.
+                </small>
+              </div>
               <h6 class="mb-3">Console Output</h6>
               <div id="consoleOutput"></div>
               <div class="input-group mt-3">
@@ -1085,6 +1250,18 @@ def index():
 
     var markers = {};
     var frameModal = new bootstrap.Modal(document.getElementById('frameModal'));
+    var frameCollapseElement = document.getElementById('frameCollapse');
+    var frameCollapseIcon = document.getElementById('frameCollapseIcon');
+    if (frameCollapseElement && frameCollapseIcon) {
+      frameCollapseElement.addEventListener('hide.bs.collapse', function () {
+        frameCollapseIcon.classList.remove('bi-chevron-up');
+        frameCollapseIcon.classList.add('bi-chevron-down');
+      });
+      frameCollapseElement.addEventListener('show.bs.collapse', function () {
+        frameCollapseIcon.classList.remove('bi-chevron-down');
+        frameCollapseIcon.classList.add('bi-chevron-up');
+      });
+    }
 
     function updateUI() {
       fetch('/api/frames')
@@ -1103,6 +1280,11 @@ def index():
           updateNodeSelector(nodes);
         })
         .catch(err => console.error('Error fetching nodes:', err));
+
+      fetch('/api/photos')
+        .then(response => response.json())
+        .then(photos => updatePhotoList(photos))
+        .catch(err => console.error('Error fetching photos:', err));
     }
 
     function calculateDistance(loc1, loc2) {
@@ -1176,6 +1358,11 @@ async function loadNodeInfo() {
     // Parse coordinates with validation
     const lat = parseFloat(info.Latitude || '0');
     const lon = parseFloat(info.Longitude || '0');
+
+    const fromCallInput = document.getElementById('photoFromCall');
+    if (fromCallInput && info['Station Callsign']) {
+      fromCallInput.value = info['Station Callsign'];
+    }
     
     // Only proceed if we have valid coordinates
     if (isNaN(lat) || isNaN(lon) || lat === 0 || lon === 0) {
@@ -1453,6 +1640,195 @@ loadNodeInfo();
       }
     }
 
+    function updatePhotoList(photos) {
+      const container = document.getElementById('photoList');
+      container.innerHTML = '';
+
+      if (!photos || photos.length === 0) {
+        container.innerHTML = '<div class="list-group-item text-muted small">No photos received yet</div>';
+        return;
+      }
+
+      photos.forEach(photo => {
+        const sizeKb = (photo.size / 1024).toFixed(1);
+        const item = document.createElement('a');
+        item.className = 'list-group-item list-group-item-action';
+        item.href = `/api/photos/${encodeURIComponent(photo.id)}`;
+        item.target = '_blank';
+        item.innerHTML = `
+          <div class="d-flex justify-content-between align-items-start">
+            <div>
+              <strong><i class="bi bi-image me-2"></i>${escapeHtml(photo.original_name || photo.stored_name)}</strong>
+              <div class="text-muted small">${photo.source} • ${photo.received_at}</div>
+            </div>
+            <span class="badge bg-secondary">${sizeKb} KB</span>
+          </div>
+        `;
+        container.appendChild(item);
+      });
+    }
+
+    let nodeSettingsCache = {};
+    const nodeSettingsInputsSelector = '[data-setting-key]';
+
+    function setNodeSettingsStatus(message, level = 'secondary') {
+      const statusBox = document.getElementById('nodeSettingsStatus');
+      if (!statusBox) return;
+      if (!message) {
+        statusBox.classList.add('d-none');
+        return;
+      }
+      statusBox.className = `alert alert-${level} small mt-2`;
+      statusBox.textContent = message;
+      statusBox.classList.remove('d-none');
+    }
+
+    function populateNodeSettingsForm(settings) {
+      nodeSettingsCache = settings || {};
+      const inputs = document.querySelectorAll(nodeSettingsInputsSelector);
+      inputs.forEach(input => {
+        const key = input.dataset.settingKey;
+        if (!key) return;
+        const value = nodeSettingsCache[key];
+        input.value = value !== undefined ? value : '';
+      });
+    }
+
+    async function refreshNodeSettings() {
+      try {
+        const response = await fetch('/api/settings');
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(text || `HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        if (data.status !== 'ok') {
+          throw new Error(data.error || 'Settings command failed');
+        }
+        populateNodeSettingsForm(data.settings || {});
+        setNodeSettingsStatus('Settings synced from hat.', 'secondary');
+      } catch (err) {
+        console.error('Settings fetch error', err);
+        setNodeSettingsStatus(`Error loading settings: ${err.message || err}`, 'danger');
+      }
+    }
+
+    async function saveNodeSettings() {
+      const saveBtn = document.getElementById('nodeSettingsSaveBtn');
+      const inputs = document.querySelectorAll(nodeSettingsInputsSelector);
+      const updates = [];
+      inputs.forEach(input => {
+        const key = input.dataset.settingKey;
+        if (!key) return;
+        const newValue = input.value.trim();
+        const currentValue = nodeSettingsCache[key] !== undefined ? String(nodeSettingsCache[key]).trim() : '';
+        if (newValue !== currentValue) {
+          updates.push({ key, value: newValue });
+        }
+      });
+
+      if (!updates.length) {
+        setNodeSettingsStatus('No changes to apply.', 'info');
+        return;
+      }
+
+      if (saveBtn) {
+        saveBtn.disabled = true;
+      }
+      setNodeSettingsStatus('Applying settings...', 'info');
+
+      try {
+        for (const update of updates) {
+          const response = await fetch('/api/settings', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(update)
+          });
+          const data = await response.json();
+          if (!response.ok || data.status !== 'ok') {
+            throw new Error(data.error || `Failed to update ${update.key}`);
+          }
+        }
+        await refreshNodeSettings();
+        setNodeSettingsStatus('Settings queued for the hat. Monitor pending file for application.', 'success');
+      } catch (err) {
+        console.error('Settings save error', err);
+        setNodeSettingsStatus(`Apply failed: ${err.message || err}`, 'danger');
+      } finally {
+        if (saveBtn) {
+          saveBtn.disabled = false;
+        }
+      }
+    }
+
+    const photoStatusBox = document.getElementById('photoUploadStatus');
+    const photoForm = document.getElementById('photoUploadForm');
+
+    function setPhotoStatus(message, level = 'secondary') {
+      if (!photoStatusBox) return;
+      photoStatusBox.className = `alert alert-${level} small mt-3`;
+      if (!message) {
+        photoStatusBox.classList.add('d-none');
+      } else {
+        photoStatusBox.textContent = message;
+        photoStatusBox.classList.remove('d-none');
+      }
+    }
+
+    if (photoForm) {
+      photoForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const fileInput = document.getElementById('photoFile');
+        if (!fileInput || fileInput.files.length === 0) {
+          setPhotoStatus("Please choose an image to send.", "warning");
+          return;
+        }
+
+        const submitBtn = photoForm.querySelector('button[type="submit"]');
+        if (submitBtn) {
+          submitBtn.disabled = true;
+          submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Sending...';
+        }
+        setPhotoStatus("Sending photo over RF link...", "info");
+
+        try {
+          const formData = new FormData(photoForm);
+          const response = await fetch('/api/photos/send', {
+            method: 'POST',
+            body: formData
+          });
+
+          const result = await response.json();
+          if (!response.ok) {
+            throw new Error(result.error || `Upload failed (${response.status})`);
+          }
+
+          setPhotoStatus(
+            `Queued ${result.filename} (${(result.bytes / 1024).toFixed(1)} KB) in ${result.chunks} frames (file_id=0x${result.file_id.toString(16).padStart(4, '0')}).`,
+            "success"
+          );
+          photoForm.reset();
+          const fromField = document.getElementById('photoFromCall');
+          if (fromField) fromField.value = result.from;
+          const toCallField = document.getElementById('photoToCall');
+          if (toCallField) toCallField.value = result.to;
+          const connField = document.getElementById('photoConnectionless');
+          if (connField) connField.checked = result.connectionless;
+          const repeatField = document.getElementById('photoRepeatable');
+          if (repeatField) repeatField.checked = result.repeatable;
+          setTimeout(updateUI, 1500);
+        } catch (err) {
+          console.error('Photo upload error', err);
+          setPhotoStatus(err.message || 'Photo send failed.', 'danger');
+        } finally {
+          if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = '<i class="bi bi-upload"></i> Send Photo';
+          }
+        }
+      });
+    }
+
     function escapeHtml(unsafe) {
       return unsafe
            .replace(/&/g, "&amp;")
@@ -1664,6 +2040,7 @@ loadNodeInfo();
       document.getElementById('consoleOutput').textContent = '';
       
       try {
+        await refreshNodeSettings();
         const response = await fetch('/api/mode', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
@@ -1785,6 +2162,47 @@ def api_nodeinfo():
     
     return jsonify(response)
 
+@app.route("/api/settings", methods=["GET"])
+def api_settings_get():
+    try:
+        response = local_command_manager.send_command("get_settings")
+    except LocalCommandTimeout:
+        return jsonify({"error": "timeout waiting for settings"}), 504
+    status = response.get("status", "error")
+    if status != "ok":
+        return jsonify({"error": response.get("message", "command failed"), "status": status}), 500
+    data = response.get("data", "{}")
+    try:
+        settings = json.loads(data)
+    except Exception:
+        settings = {}
+    return jsonify({"status": "ok", "settings": settings})
+
+@app.route("/api/settings", methods=["POST"])
+def api_settings_set():
+    global node_info
+    payload = request.get_json(force=True)
+    key = (payload.get("key") or "").strip()
+    value = payload.get("value", "")
+    if not key:
+        return jsonify({"error": "missing key"}), 400
+    try:
+        response = local_command_manager.send_command("set_param", {"key": key, "value": str(value)})
+    except LocalCommandTimeout:
+        return jsonify({"error": "timeout applying setting"}), 504
+    status = response.get("status", "error")
+    if status != "ok":
+        return jsonify({"error": response.get("message", "command failed"), "status": status}), 500
+    if isinstance(node_info, dict):
+        node_info[key] = value
+    node_info_cache[key] = value
+    try:
+        with open("nodeinfo.json", "w") as f:
+            json.dump(node_info_cache, f, indent=2)
+    except Exception as exc:
+        print(f"[SETTINGS] Failed to update cache file: {exc}")
+    return jsonify({"status": "ok", "key": key, "value": value})
+
 @app.route("/api/frames")
 def api_frames():
     limit = min(int(request.args.get('limit', 50)), 100)
@@ -1817,6 +2235,114 @@ def api_chat():
         limit = min(int(request.args.get('limit', 100)), CHAT_MAX_HISTORY)
         # Return newest-first for convenience
         return jsonify(list(chat_history[node])[:limit])
+
+@app.route("/api/photos")
+def api_photos():
+    return jsonify(photo_manager.list_photos())
+
+@app.route("/api/photos/send", methods=["POST"])
+def api_photo_send():
+    if "photo" not in request.files:
+        return jsonify({"error": "missing photo file"}), 400
+
+    file_storage = request.files["photo"]
+    image_bytes = file_storage.read()
+    if not image_bytes:
+        return jsonify({"error": "empty file"}), 400
+
+    from_call = (request.form.get("fromCall") or get_local_callsign()).strip().upper() or get_local_callsign()
+    to_call = (request.form.get("toCall") or "BROADCAST").strip().upper() or "BROADCAST"
+
+    def parse_int(field: str, default: int) -> int:
+        value = request.form.get(field, "")
+        if not value:
+            return default
+        try:
+            return int(value, 0)
+        except ValueError:
+            raise PhotoSendError(f"Invalid integer for {field}")
+
+    try:
+        from_port = parse_int("fromPort", PHOTO_DEFAULT_FROM_PORT)
+        to_port = parse_int("toPort", PHOTO_DEFAULT_TO_PORT)
+        max_payload = parse_int("maxPayload", PHOTO_MAX_PAYLOAD)
+    except PhotoSendError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    delay_value = request.form.get("delay", "")
+    try:
+        delay = float(delay_value) if delay_value else PHOTO_DELAY
+    except ValueError:
+        return jsonify({"error": "Invalid delay value"}), 400
+
+    resize_value = request.form.get("resize", "").strip()
+    quality_value = request.form.get("quality", "")
+    try:
+        quality = int(quality_value) if quality_value else 75
+    except ValueError:
+        return jsonify({"error": "Invalid quality value"}), 400
+
+    resize = None
+    if resize_value:
+        try:
+            resize = parse_resize(resize_value)
+        except PhotoSendError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    repeatable = request.form.get("repeatable") == "on"
+    connectionless = request.form.get("connectionless", "on") == "on"
+
+    try:
+        result = send_photo_bytes(
+            image_bytes=image_bytes,
+            filename=file_storage.filename or "upload.bin",
+            resize=resize,
+            quality=quality,
+            max_payload=max_payload,
+            delay=delay,
+            udp_host=PHOTO_SPI_HOST,
+            udp_port=PHOTO_SPI_PORT,
+            from_call=from_call,
+            from_port=from_port,
+            to_call=to_call,
+            to_port=to_port,
+            repeatable=repeatable,
+            connectionless=connectionless,
+            file_id=None,
+        )
+    except PhotoSendError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("[PHOTO] Unexpected send error during upload")
+        return jsonify({"error": f"internal error: {exc}"}), 500
+
+    response = {
+        "status": "sent",
+        "from": from_call,
+        "to": to_call,
+        "chunks": result["chunks"],
+        "bytes": result["bytes"],
+        "file_id": result["file_id"],
+        "filename": result["filename"],
+        "delay": delay,
+        "max_payload": max_payload,
+        "repeatable": repeatable,
+        "connectionless": connectionless,
+    }
+    return jsonify(response), 200
+
+@app.route("/api/photos/<photo_id>")
+def api_photo_download(photo_id):
+    info = photo_manager.get_photo(photo_id)
+    if not info:
+        return jsonify({"error": "not found"}), 404
+    download_name = info.get("original_name") or info["stored_name"]
+    return send_from_directory(
+        photo_manager.storage_dir,
+        info["stored_name"],
+        as_attachment=True,
+        download_name=download_name,
+    )
 
 @app.route("/api/console/read")
 def api_console_read():

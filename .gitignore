@@ -1,0 +1,31 @@
+# Byte-compiled / cached files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ip400-venv/
+
+# Packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# Logs and runtime output
+*.log
+server.log
+
+# Application data
+photos/*
+!photos/.gitkeep
+nodeinfo.json
+
+# IDE / tooling
+.idea/
+.vscode/
+*.swp
+*.swo
+*.DS_Store
