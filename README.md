@@ -52,6 +52,45 @@ On startup the server:
 2. Launches three daemon threads: UDP listener, chat loop, console loop.
 3. Serves the Flask UI/API at `http://<web-host>:<web-port>`.
 
+### Autostarting the Ip400Spi bridge
+
+The Flask server expects IP4C frames on UDP port `9000`. If you use the
+`Ip400Spi` helper to forward frames from the HAT’s SPI interface, run it as a
+systemd service so it starts at boot:
+
+1. Copy `Ip400Spi` (and any helper scripts) into a permanent location, e.g.
+   `/opt/ip400`.
+2. Create `/etc/systemd/system/ip400spi.service` with:
+
+   ```ini
+   [Unit]
+   Description=IP400 SPI to UDP bridge
+   After=network-online.target
+   Wants=network-online.target
+
+   [Service]
+   Type=simple
+   WorkingDirectory=/opt/ip400
+   ExecStart=/opt/ip400/Ip400Spi -s /dev/spidev0.0 -n 192.168.1.239 -p 9000 -m 9001 -d 1
+   Restart=on-failure
+   User=ip400
+   Group=ip400
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   Adjust `-n`/`-p`/`-m` flags or the `User`/`Group` to match your setup.
+3. Reload systemd and enable the service:
+
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now ip400spi.service
+   ```
+
+Check status with `sudo systemctl status ip400spi.service`. Logs appear under
+`journalctl -u ip400spi.service`.
+
 ### Console & Chat Coordination
 
 - Opening the **Settings** modal on the web UI calls `/api/mode` to pause the

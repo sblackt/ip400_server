@@ -235,39 +235,34 @@ def decode_excess40_callsign(call_bytes: bytes) -> str:
         return "INVALID"
     
     try:
-        value = struct.unpack('>I', call_bytes)[0]
-        
         char_map = "0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ_-@"
-        
-        if value == 0xFFFFFFFF:
+
+        # Handle known sentinel values up front
+        if call_bytes == b"\xff\xff\xff\xff":
             return "BROADCAST"
-        if value == 0:
+        if call_bytes == b"\x00\x00\x00\x00":
             return "EMPTY"
+
+        def decode(value: int) -> str:
+            decoded_chars = []
+            for _ in range(6):
+                if value == 0:
+                    break
+                char_index = value % 40
+                decoded_chars.append(char_map[char_index])
+                value //= 40
+            return "".join(reversed(decoded_chars)).strip()
         
-        # Try big-endian first
-        decoded_chars = []
-        for i in range(6):
-            if value == 0:
-                break
-            char_index = value % 40
-            decoded_chars.append(char_map[char_index])
-            value //= 40
-        
-        callsign = "".join(reversed(decoded_chars)).strip()
-        
-        # If big-endian didn't work well, try little-endian
-        value = struct.unpack('<I', call_bytes)[0]
-        
-        decoded_chars = []
-        for _ in range(6):
-            if value == 0:
-                break
-            char_index = value % 40
-            decoded_chars.append(char_map[char_index])
-            value //= 40
-        
-        # Return the little-endian result
-        return "".join(reversed(decoded_chars)).strip()
+        big_value = struct.unpack(">I", call_bytes)[0]
+        little_value = struct.unpack("<I", call_bytes)[0]
+
+        big = decode(big_value)
+        little = decode(little_value)
+
+        # Prefer whichever decode yields more characters; fall back gracefully.
+        candidates = [little, big]
+        best = max(candidates, key=lambda s: (len(s), s != "", s))
+        return best or "UNKNOWN"
         
     except Exception as e:
         return f"0x{call_bytes.hex()}"
@@ -452,10 +447,38 @@ def udp_listener():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((UDP_IP, UDP_PORT))
     print(f"Listening on UDP {UDP_IP}:{UDP_PORT}...")
+
+    def normalize_frame(data: bytes) -> bytes:
+        if data.startswith(b"IP4C"):
+            return data
+        stripped = data.strip()
+        if len(stripped) >= 8:
+            try:
+                ascii_candidate = stripped.decode("ascii")
+            except UnicodeDecodeError:
+                return data
+            if all((c in "0123456789abcdefABCDEF") or c.isspace() for c in ascii_candidate):
+                clean_hex = "".join(c for c in ascii_candidate if c in "0123456789abcdefABCDEF")
+                if len(clean_hex) >= 8:
+                    try:
+                        decoded = bytes.fromhex(clean_hex)
+                        if decoded.startswith(b"IP4C"):
+                            print(f"[UDP] Decoded ASCII hex payload into IP4C frame (len={len(decoded)})")
+                            return decoded
+                    except ValueError:
+                        pass
+        return data
+
     while True:
         try:
             data, addr = sock.recvfrom(4096)
-            beacon = parse_ip400_frame(data)
+            print(f"[UDP] RX {len(data)} bytes from {addr}")
+            frame = normalize_frame(data)
+            if not frame.startswith(b"IP4C"):
+                preview = data[:32]
+                print(f"[UDP] Ignoring non-IP4C payload from {addr}, len={len(data)}, preview={preview!r}")
+                continue
+            beacon = parse_ip400_frame(frame)
             if beacon:
                 if (beacon.coding & 0x0F) == CODING_LOCAL_COMMAND:
                     if beacon.payload:
@@ -468,10 +491,11 @@ def udp_listener():
                     'rssi': beacon.rssi,
                     'location': beacon.location,
                     'frame_count': node_history.get(node_id, {}).get('frame_count', 0) + 1,
-                    'last_data': data.hex(),
+                    'last_data': frame.hex(),
                     'packet_type': get_packet_type_name(beacon.coding),
                     # optionally mark local if matches configured callsign (not set here)
                 }
+                print(f"[UDP] Stored frame from {node_id} (coding=0x{beacon.coding:02X}, hops={beacon.hop_count}, len={len(frame)})")
                 try:
                     if (beacon.coding & 0x0F) == 0x03 and beacon.payload:
                         photo_info = photo_manager.handle_frame(beacon.from_call or "UNKNOWN", beacon.payload)
@@ -669,6 +693,16 @@ def ip400_chat_thread():
                     text_stripped = text.strip()
                     if not text_stripped:
                         continue
+
+                    # If we're waiting for the body of a previously seen message header,
+                    # merge it with this line before any filtering/echo checks.
+                    if pending_sender:
+                        if not text_stripped:
+                            # Still waiting on actual content; keep header cached
+                            continue
+                        header_text = pending_sender.rstrip(':').rstrip()
+                        text_stripped = f"{header_text}: {text_stripped}"
+                        pending_sender = None
                     
                     # Skip known system/console messages
                     skip_patterns = [
@@ -692,7 +726,13 @@ def ip400_chat_thread():
                     if ']:' in text_stripped:
                         parts = text_stripped.split(']:', 1)
                         if len(parts) == 2:
-                            message_only = parts[1].strip()
+                            message_fragment = parts[1].strip()
+                            if message_fragment:
+                                message_only = message_fragment
+                            else:
+                                # Header with no inline payload; capture the header and wait for the next line
+                                pending_sender = text_stripped
+                                continue
                     
                     # Check against recently sent messages (within last 5 seconds)
                     for sent_msg, sent_time in list(recent_sent_messages):
