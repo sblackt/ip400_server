@@ -5,6 +5,7 @@ import threading
 import time
 import json
 import struct
+import re
 from datetime import datetime
 from collections import deque, defaultdict
 from dataclasses import dataclass, asdict
@@ -187,7 +188,7 @@ class Beacon:
     hop_count: int = 0
     coding: int = 0
     flags: int = 0
-    rssi: Optional[int] = None
+    rssi: Optional[float] = None
     snr: Optional[float] = None
     frequency: Optional[float] = None
     location: Optional[Tuple[float, float]] = None
@@ -211,7 +212,7 @@ class Beacon:
             'status': self.status,
             'offset': self.offset,
             'length': self.length,
-            'rssi': self.rssi,
+            'rssi': float(self.rssi) if self.rssi is not None else None,
             'snr': float(self.snr) if self.snr is not None else None,
             'frequency': float(self.frequency) if self.frequency is not None else None,
             'location': list(self.location) if self.location else None,
@@ -311,6 +312,88 @@ def parse_beacon_payload(payload: bytes) -> dict:
     except Exception:
         return {'raw': payload.decode('ascii', errors='replace')}
 
+
+def extract_signal_metadata(metadata: bytes, attr_type: Optional[int] = None) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Best-effort decoding of RSSI/SNR/frequency metadata shipped with frames."""
+    if not metadata:
+        return None, None, None
+
+    cleaned = metadata.strip(b'\x00')
+    if not cleaned:
+        return None, None, None
+
+    rssi: Optional[float] = None
+    snr: Optional[float] = None
+    frequency: Optional[float] = None
+
+    def _scale(value: int, scale: float = 1024.0) -> float:
+        return value / scale
+
+    if attr_type == 0x09:
+        if len(cleaned) >= 2:
+            raw_rssi = struct.unpack_from('<h', cleaned, 0)[0]
+            candidate = _scale(raw_rssi)
+            if -200 <= candidate <= 0:
+                rssi = round(candidate, 1)
+        if len(cleaned) >= 4:
+            raw_snr = struct.unpack_from('<h', cleaned, 2)[0]
+            candidate = _scale(raw_snr)
+            if -200 <= candidate <= 200:
+                snr = round(candidate, 2)
+        return rssi, snr, frequency
+
+    text = ""
+    try:
+        text = cleaned.decode('ascii', errors='ignore').strip()
+    except Exception:
+        text = ""
+
+    if text:
+        rssi_match = re.search(r'rssi\s*[:=]\s*(-?\d+(?:\.\d+)?)', text, re.IGNORECASE)
+        if rssi_match:
+            try:
+                rssi = float(rssi_match.group(1))
+            except ValueError:
+                rssi = None
+
+        snr_match = re.search(r'snr\s*[:=]\s*(-?\d+(?:\.\d+)?)', text, re.IGNORECASE)
+        if snr_match:
+            try:
+                snr = float(snr_match.group(1))
+            except ValueError:
+                snr = None
+
+        freq_match = re.search(r'(?:freq|frequency)\s*[:=]\s*(-?\d+(?:\.\d+)?)', text, re.IGNORECASE)
+        if freq_match:
+            try:
+                frequency = float(freq_match.group(1))
+            except ValueError:
+                frequency = None
+
+        if rssi is not None or snr is not None or frequency is not None:
+            return rssi, snr, frequency
+
+    if len(cleaned) >= 2 and rssi is None:
+        raw_rssi = struct.unpack_from('<h', cleaned, 0)[0]
+        candidate = _scale(raw_rssi)
+        if -200 <= candidate <= 0:
+            rssi = round(candidate, 1)
+
+    if len(cleaned) >= 4 and snr is None:
+        raw_snr = struct.unpack_from('<h', cleaned, 2)[0]
+        candidate = _scale(raw_snr)
+        if -200 <= candidate <= 200:
+            snr = round(candidate, 2)
+
+    if len(cleaned) >= 6 and frequency is None:
+        raw_freq = struct.unpack_from('<h', cleaned, 4)[0]
+        candidate = _scale(raw_freq)
+        if abs(candidate) > 0.01:
+            frequency = round(candidate, 3)
+
+    return rssi, snr, frequency
+
+
 def get_packet_type_name(coding: int) -> str:
     packet_types = {
         0x00: "UTF-8 Text",
@@ -355,8 +438,47 @@ def parse_ip400_frame(frame: bytes) -> Optional[Beacon]:
             hop_table_size = beacon.hop_count * 4
             payload_start += hop_table_size
         if payload_start < len(frame):
-            beacon.payload = frame[payload_start:]
-            if (beacon.coding & 0x0F) == 0x04:
+            payload_length = max(beacon.length, 0)
+            payload_end = min(len(frame), payload_start + payload_length)
+
+            payload_section = frame[payload_start:payload_end]
+            metadata_segments: List[Tuple[Optional[int], bytes]] = []
+
+            if beacon.flags & 0x80 and len(payload_section) >= 2:
+                attr_index = 0
+                section_len = len(payload_section)
+                while attr_index + 2 <= section_len:
+                    attr_type = payload_section[attr_index]
+                    attr_len = payload_section[attr_index + 1]
+                    if attr_len < 2 or attr_index + attr_len > section_len:
+                        break
+                    attr_data = payload_section[attr_index + 2: attr_index + attr_len]
+                    metadata_segments.append((attr_type, attr_data))
+                    attr_index += attr_len
+                payload_section = payload_section[attr_index:]
+
+            if beacon.offset and beacon.offset <= len(payload_section):
+                metadata_segments.append((None, payload_section[:beacon.offset]))
+                payload_section = payload_section[beacon.offset:]
+
+            trailing = frame[payload_end:]
+            if trailing and len(trailing) <= 16:
+                metadata_segments.append((None, trailing))
+
+            beacon.payload = payload_section
+
+            for attr_type, metadata_bytes in metadata_segments:
+                if not metadata_bytes:
+                    continue
+                rssi, snr, frequency = extract_signal_metadata(metadata_bytes, attr_type)
+                if rssi is not None and beacon.rssi is None:
+                    beacon.rssi = rssi
+                if snr is not None and beacon.snr is None:
+                    beacon.snr = snr
+                if frequency is not None and beacon.frequency is None:
+                    beacon.frequency = frequency
+
+            if beacon.payload and (beacon.coding & 0x0F) == 0x04:
                 beacon_info = parse_beacon_payload(beacon.payload)
                 if 'latitude' in beacon_info and 'longitude' in beacon_info:
                     beacon.location = (beacon_info['latitude'], beacon_info['longitude'])
@@ -369,15 +491,14 @@ def parse_ip400_frame(frame: bytes) -> Optional[Beacon]:
 
 # Node Info
 
-import re
-
 node_info_cache = {}
 
 def read_ip400_node_info():
     """Read node info using the working ip400_read_parameters function."""
     global node_info, node_info_cache
-    
+
     print("[NODEINFO] Fetching node info from IP400...")
+    info = None
     
     # First try to load from the temp file (which is updated by ip400_read_parameters)
     if os.path.exists("/tmp/ip400_node.json"):
@@ -414,7 +535,7 @@ def read_ip400_node_info():
     else:
         print("[NODEINFO] Could not read node info from any source")
     
-    return info
+    return info or {}
 
 
 def get_local_callsign(default: str = "N0CALL") -> str:
@@ -486,11 +607,14 @@ def udp_listener():
                     continue
                 frame_history.appendleft(beacon)
                 node_id = f"{beacon.from_call}:{beacon.from_port}"
+                existing = node_history.get(node_id, {})
                 node_history[node_id] = {
                     'last_seen': beacon.timestamp,
-                    'rssi': beacon.rssi,
-                    'location': beacon.location,
-                    'frame_count': node_history.get(node_id, {}).get('frame_count', 0) + 1,
+                    'rssi': beacon.rssi if beacon.rssi is not None else existing.get('rssi'),
+                    'snr': beacon.snr if beacon.snr is not None else existing.get('snr'),
+                    'frequency': beacon.frequency if beacon.frequency is not None else existing.get('frequency'),
+                    'location': beacon.location or existing.get('location'),
+                    'frame_count': existing.get('frame_count', 0) + 1,
                     'last_data': frame.hex(),
                     'packet_type': get_packet_type_name(beacon.coding),
                     # optionally mark local if matches configured callsign (not set here)
@@ -512,8 +636,6 @@ def udp_listener():
             traceback.print_exc()
 
 # Node Info Parse
-
-import re
 
 def ip400_read_parameters():
     """Query IP400 'A' menu and parse setup parameters into a dict."""
@@ -620,7 +742,38 @@ def ip400_chat_thread():
 
     ser = None
     chat_mode_entered = False
-    pending_sender = None  # Track sender from previous line for multi-line messages
+    pending_sender = None  # Track sender/header from previous line for multi-line messages
+    header_line_pattern = re.compile(r'^(?P<header>.+?\[[^\]]*\])\s*:\s*(?P<body>.*)$')
+
+    def looks_like_chat_header_prefix(segment: str) -> bool:
+        """Heuristic to determine whether a segment resembles a chat header."""
+        seg = (segment or "").strip()
+        if not seg:
+            return False
+        lowered = seg.lower()
+        disallowed_starts = (
+            'welcome to chat', 'esc to set', 'ctrl/', 'repeat mode',
+            'destination callsign', 'main menu', 'settings', 'network',
+            'radio', 'info', 'chat mode', 'console mode', 'enter command',
+            'invalid command', 'unknown command', 'command not found',
+            'press any key', 'select an option', 'option'
+        )
+        if any(lowered.startswith(prefix) for prefix in disallowed_starts):
+            return False
+        if any(token in seg for token in ('>', '[', ' to ', ')', '(')):
+            return True
+        stripped = seg.replace('-', '').replace('_', '').replace(' ', '')
+        return bool(stripped) and stripped.isalnum() and seg == seg.upper() and len(stripped) <= 12
+
+    def is_probable_chat_header(line: str) -> bool:
+        """Heuristic to detect chat headers that arrive without an immediate body."""
+        stripped = (line or "").strip()
+        if not stripped:
+            return False
+        if ':' in stripped:
+            header_part, body_part = stripped.split(':', 1)
+            return looks_like_chat_header_prefix(header_part) and not body_part.strip()
+        return looks_like_chat_header_prefix(stripped)
     
     def send_command(cmd, delay=0.2):
         """Helper to send a command to the serial port with optional delay after"""
@@ -716,41 +869,82 @@ def ip400_chat_thread():
                     if any(pattern in text_stripped for pattern in skip_patterns) or \
                        text_stripped in ['C', 'M', 'S', 'N', 'R', 'I']:  # Single-letter menu commands
                         continue
-                    
-                    # Check if this is an echo of a recently sent message
-                    is_echo = False
-                    current_time = time.time()
-                    
-                    # Extract just the message part if it's in the format "CALLSIGN(...) DEST[...]:<message>"
-                    message_only = text_stripped
-                    if ']:' in text_stripped:
-                        parts = text_stripped.split(']:', 1)
-                        if len(parts) == 2:
-                            message_fragment = parts[1].strip()
-                            if message_fragment:
-                                message_only = message_fragment
+
+                    entry_text = None
+                    message_only = None
+
+                    # Case 1: header and body on the same line (classic format)
+                    header_match = header_line_pattern.match(text_stripped)
+                    if header_match and looks_like_chat_header_prefix(header_match.group('header')):
+                        header_clean = header_match.group('header').strip()
+                        body_idx = header_match.start('body')
+                        body_original = text_stripped[body_idx:] if body_idx is not None else ""
+                        body_clean = body_original.strip()
+                        if body_clean:
+                            entry_text = f"{header_clean}: {body_original}"
+                            message_only = body_clean
+                            pending_sender = None
+                        else:
+                            pending_sender = f"{header_clean}:"
+                            print(f"[CHAT] Pending message body after header: {pending_sender}")
+                            continue
+                    elif ':' in text_stripped:
+                        header_part, body_part = text_stripped.split(':', 1)
+                        if looks_like_chat_header_prefix(header_part):
+                            body_clean = body_part.strip()
+                            header_clean = header_part.strip()
+                            if body_clean:
+                                entry_text = f"{header_clean}: {body_part.lstrip()}"
+                                message_only = body_clean
+                                pending_sender = None
                             else:
-                                # Header with no inline payload; capture the header and wait for the next line
-                                pending_sender = text_stripped
+                                pending_sender = f"{header_clean}:"
+                                print(f"[CHAT] Pending message body after header: {pending_sender}")
                                 continue
-                    
-                    # Check against recently sent messages (within last 5 seconds)
-                    for sent_msg, sent_time in list(recent_sent_messages):
-                        if current_time - sent_time < 5.0:  # 5 second window
-                            if message_only == sent_msg or text_stripped.endswith(sent_msg):
-                                is_echo = True
-                                print(f"[CHAT] Echo suppressed: {message_only}")
-                                break
-                    
-                    if not is_echo:
-                        # Only store messages that look like actual chat (not console output)
-                        # Look for the pattern of a chat message: CALLSIGN(...) DEST[...]: message
-                        if ']' in text_stripped and ':' in text_stripped.split(']')[-1]:
-                            entry = {"timestamp": datetime.utcnow().isoformat() + 'Z', "text": text_stripped}
-                            chat_history["broadcast"].appendleft(entry)
-                            print(f"[CHAT] Stored chat message: {text_stripped}")
                         else:
                             print(f"[CHAT] Filtered console output: {text_stripped}")
+                            continue
+                    # Case 2: we previously saw a header without a body; treat this line as the body
+                    elif pending_sender:
+                        body = text_stripped
+                        message_only = body.strip()
+                        if not message_only:
+                            # Ignore empty bodies but keep waiting
+                            continue
+                        if pending_sender.rstrip().endswith(':'):
+                            entry_text = f"{pending_sender} {body}"
+                        else:
+                            entry_text = f"{pending_sender}: {body}"
+                        print(f"[CHAT] Combined pending header with body: {entry_text}")
+                        pending_sender = None
+                    # Case 3: this looks like a header that will be followed by a body
+                    elif is_probable_chat_header(text_stripped):
+                        header_clean = text_stripped.strip()
+                        if not header_clean.endswith(':'):
+                            header_clean += ':'
+                        pending_sender = header_clean
+                        print(f"[CHAT] Detected header without body; waiting for next line: {pending_sender}")
+                        continue
+                    else:
+                        print(f"[CHAT] Filtered console output: {text_stripped}")
+                        continue
+
+                    # Echo suppression: compare against recently sent messages (within last 5 seconds)
+                    is_echo = False
+                    current_time = time.time()
+                    for sent_msg, sent_time in list(recent_sent_messages):
+                        if current_time - sent_time < 5.0:
+                            comparison_target = message_only or entry_text
+                            if comparison_target and (comparison_target == sent_msg or comparison_target.endswith(sent_msg)):
+                                is_echo = True
+                                print(f"[CHAT] Echo suppressed: {comparison_target}")
+                                break
+                    if is_echo:
+                        continue
+
+                    entry = {"timestamp": datetime.utcnow().isoformat() + 'Z', "text": entry_text}
+                    chat_history["broadcast"].appendleft(entry)
+                    print(f"[CHAT] Stored chat message: {entry_text}")
                         
                 except Exception as e:
                     print(f"[CHAT] Error processing incoming message: {e}")
@@ -917,6 +1111,57 @@ def index():
     .location-info {
         font-size: 0.85em;
         color: #6c757d;
+    }
+    .signal-wrapper {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 2px;
+    }
+    .signal-wrapper small {
+      font-size: 0.7rem;
+      color: #6c757d;
+      line-height: 1;
+    }
+    .signal-indicator {
+      display: inline-flex;
+      align-items: flex-end;
+      gap: 2px;
+    }
+    .signal-indicator .bar {
+      width: 4px;
+      background-color: #ced4da;
+      opacity: 0.35;
+      border-radius: 2px;
+      transition: opacity 0.2s ease, background-color 0.2s ease;
+    }
+    .signal-indicator .bar:nth-child(1) { height: 6px; }
+    .signal-indicator .bar:nth-child(2) { height: 10px; }
+    .signal-indicator .bar:nth-child(3) { height: 14px; }
+    .signal-indicator .bar:nth-child(4) { height: 18px; }
+    .signal-indicator.signal-strong .bar {
+      background-color: #198754;
+      opacity: 1;
+    }
+    .signal-indicator.signal-medium .bar:nth-child(-n+3) {
+      background-color: #ffc107;
+      opacity: 1;
+    }
+    .signal-indicator.signal-medium .bar:nth-child(4) {
+      opacity: 0.25;
+    }
+    .signal-indicator.signal-weak .bar:nth-child(1) {
+      background-color: #dc3545;
+      opacity: 1;
+    }
+    .signal-indicator.signal-weak .bar:nth-child(n+2) {
+      opacity: 0.2;
+    }
+    .signal-indicator.signal-unknown .bar {
+      opacity: 0.2;
+    }
+    .node-meta {
+      min-width: 88px;
     }
     .frame-row { cursor: pointer; }
     .frame-row:hover { background-color: #f8f9fa; }
@@ -1490,18 +1735,50 @@ loadNodeInfo();
     }
 
     function getSignalStrengthClass(rssi) {
-      if (rssi === undefined || rssi === null) return 'signal-unknown';
-      if (rssi >= -70) return 'signal-strong';
-      if (rssi >= -85) return 'signal-medium';
+      const value = Number(rssi);
+      if (!Number.isFinite(value)) return 'signal-unknown';
+      if (value >= -70) return 'signal-strong';
+      if (value >= -85) return 'signal-medium';
       return 'signal-weak';
     }
 
     function formatSignalStrength(rssi) {
-      if (rssi === undefined || rssi === null) return 'N/A';
-      return `${rssi} dBm`;
+      const value = Number(rssi);
+      if (!Number.isFinite(value)) return 'N/A';
+      return `${value.toFixed(1)} dBm`;
+    }
+
+    function formatSnr(snr) {
+      const value = Number(snr);
+      if (!Number.isFinite(value)) return 'N/A';
+      return `${value.toFixed(2)} dB`;
+    }
+
+    function buildSignalTooltip(node) {
+      const parts = [];
+      const signalText = formatSignalStrength(node?.rssi);
+      if (signalText !== 'N/A') {
+        parts.push(`RSSI ${signalText}`);
+      }
+      const snrText = formatSnr(node?.snr);
+      if (snrText !== 'N/A') {
+        parts.push(`SNR ${snrText}`);
+      }
+      return parts.join(' • ') || 'Signal data unavailable';
     }
 
     let localNodeId = null;
+    let activeTooltips = [];
+
+    function refreshTooltips() {
+      if (!window.bootstrap || !bootstrap.Tooltip) return;
+      activeTooltips.forEach(t => t.dispose());
+      activeTooltips = [];
+      const elements = Array.from(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+      elements.forEach(el => {
+        activeTooltips.push(new bootstrap.Tooltip(el));
+      });
+    }
 
     function formatLocation(location) {
       if (!location || !Array.isArray(location) || location.length !== 2) return 'Unknown';
@@ -1530,6 +1807,10 @@ loadNodeInfo();
       if (localNodeId && nodes[localNodeId]) {
         const localNode = nodes[localNodeId];
         const { call: localCall, port: localPort } = splitNodeId(localNodeId);
+        const localSignalClass = getSignalStrengthClass(localNode.rssi);
+        const localSignalText = formatSignalStrength(localNode.rssi);
+        const localSnrText = formatSnr(localNode.snr);
+        const localTooltip = buildSignalTooltip(localNode);
         const localItem = document.createElement('div');
         localItem.className = 'list-group-item list-group-item-primary';
         localItem.innerHTML = `
@@ -1542,8 +1823,18 @@ loadNodeInfo();
                   <i class="bi bi-geo-alt"></i> ${formatLocation(localNode.location)}
                 </div>
               </div>
-              <div class="text-end">
-                <span class="badge bg-primary">${localNode.frame_count || 0}</span>
+              <div class="text-end node-meta ms-3">
+                <div class="signal-wrapper">
+                  <div class="signal-indicator ${localSignalClass}" data-bs-toggle="tooltip" title="${escapeHtml(localTooltip)}">
+                    <span class="bar"></span>
+                    <span class="bar"></span>
+                    <span class="bar"></span>
+                    <span class="bar"></span>
+                  </div>
+                  <small>${escapeHtml(localSignalText)}</small>
+                  ${localSnrText !== 'N/A' ? `<small>SNR ${escapeHtml(localSnrText)}</small>` : ''}
+                </div>
+                <span class="badge bg-primary mt-2">${localNode.frame_count || 0}</span>
               </div>
             </div>
           </div>
@@ -1560,6 +1851,8 @@ loadNodeInfo();
         const lastSeen = node.last_seen ? new Date(node.last_seen).toLocaleTimeString() : 'Never';
         const signalClass = getSignalStrengthClass(node.rssi);
         const signalText = formatSignalStrength(node.rssi);
+        const snrText = formatSnr(node.snr);
+        const tooltip = buildSignalTooltip(node);
         const { call, port } = splitNodeId(id);
         const distanceInfo = localNodeId && node.location && nodes[localNodeId]?.location 
           ? calculateDistance(nodes[localNodeId].location, node.location) 
@@ -1580,13 +1873,25 @@ loadNodeInfo();
               </div>
               <small class="text-muted">Last: ${lastSeen}</small>
             </div>
-            <div class="text-end">
-              <span class="badge bg-primary">${node.frame_count || 0}</span>
+            <div class="text-end node-meta ms-3">
+              <div class="signal-wrapper">
+                <div class="signal-indicator ${signalClass}" data-bs-toggle="tooltip" title="${escapeHtml(tooltip)}">
+                  <span class="bar"></span>
+                  <span class="bar"></span>
+                  <span class="bar"></span>
+                  <span class="bar"></span>
+                </div>
+                <small>${escapeHtml(signalText)}</small>
+                ${snrText !== 'N/A' ? `<small>SNR ${escapeHtml(snrText)}</small>` : ''}
+              </div>
+              <span class="badge bg-primary mt-2">${node.frame_count || 0}</span>
             </div>
           </div>
         `;
         nodeList.appendChild(item);
       });
+
+      refreshTooltips();
     }
 
     function getTypeClass(coding) {
