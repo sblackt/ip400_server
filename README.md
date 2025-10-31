@@ -1,5 +1,6 @@
 
-<img width="1277" height="687" alt="ip400_server" src="https://github.com/user-attachments/assets/594d18ea-86df-41b5-bb30-221d75214726" />
+<img width="1978" height="2218" alt="server" src="https://github.com/user-attachments/assets/dfce5411-e64e-4383-8c74-da8d2d82bc6a" />
+
 # IP400 Server
 
 This project hosts the Pi Zero 2 W gateway for an IP400 RF mesh node.  
@@ -37,7 +38,7 @@ updated server and services with the bundled helper script:
 sudo apt update
 sudo apt install git python3-venv python3-pip build-essential
 cd /home/ip400
-git clone https://github.com/<your-user>/ip400_server.git
+git clone [https://github.com/sblackt/ip400_server]
 cd ip400_server
 ./scripts/install_ip400.sh
 ```
