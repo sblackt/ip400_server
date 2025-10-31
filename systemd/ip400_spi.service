@@ -1,17 +1,32 @@
 [Unit]
+
+Description=IP400 SPI to UDP Bridge
+
+After=network.target
+
+
+
+[Service]
+
+User=ip400
+
+WorkingDirectory=/home/ip400/ip400spi
+
+ExecStart=/home/ip400/ip400spi/Ip400Spi -s /dev/spidev0.0 -n 127.0.0.1 -p 9000 >
+
+Restart=always
+
+RestartSec=3
+
+StandardOutput=append:/var/log/ip400_spi.log
+
+StandardError=append:/var/log/ip400_spi.log
+
+
+
+[Install]
+
+WantedBy=multi-user.target[Unit]
 Description=IP400 SPI to UDP bridge
 After=network-online.target
 Wants=network-online.target
-
-[Service]
-EnvironmentFile=-/etc/ip400/ip400.env
-User=ip400
-WorkingDirectory=${IP400_HOME}/ip400spi
-ExecStart=${IP400_HOME}/ip400spi/Ip400Spi -s ${IP400_SPI_DEVICE} -n ${IP400_SPI_HOST} -p ${IP400_SPI_PORT} -m ${IP400_SPI_LISTEN} -d ${IP400_SPI_DEBUG}
-Restart=always
-RestartSec=3
-StandardOutput=append:/var/log/ip400_spi.log
-StandardError=append:/var/log/ip400_spi.log
-
-[Install]
-WantedBy=multi-user.target
