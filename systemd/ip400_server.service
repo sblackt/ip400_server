@@ -3,12 +3,14 @@ Description=IP400 Flask + UDP Server
 After=network.target ip400_spi.service
 
 [Service]
-EnvironmentFile=-/etc/ip400/ip400.env
-Environment=IP400_WEB_HOST=${IP400_SERVER_HOST}
-Environment=IP400_WEB_PORT=${IP400_SERVER_PORT}
 User=ip400
-WorkingDirectory=${IP400_HOME}/ip400_server
-ExecStart=${IP400_SERVER_VENV}/bin/python3 ${IP400_HOME}/ip400_server/ip400_server.py
+WorkingDirectory=/home/ip400/ip400_server
+Environment=IP400_HOME=/home/ip400
+Environment=IP400_SERVER_VENV=/home/ip400/ip400_server/.venv
+Environment=IP400_SERVER_HOST=0.0.0.0
+Environment=IP400_SERVER_PORT=5000
+EnvironmentFile=-/etc/ip400/ip400.env
+ExecStart=/bin/sh -c 'exec "$IP400_SERVER_VENV/bin/python3" "$IP400_HOME/ip400_server/ip400_server.py"'
 Restart=always
 RestartSec=5
 StandardOutput=append:/var/log/ip400_server.log
@@ -16,3 +18,5 @@ StandardError=append:/var/log/ip400_server.log
 
 [Install]
 WantedBy=multi-user.target
+
+
