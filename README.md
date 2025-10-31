@@ -43,8 +43,6 @@ cd ip400_server
 ./scripts/install_ip400.sh
 ```
 
-Replace `<your-user>` with the GitHub account or organisation that hosts your
-fork.
 
 The script will:
 
