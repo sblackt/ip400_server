@@ -38,7 +38,7 @@ updated server and services with the bundled helper script:
 sudo apt update
 sudo apt install git python3-venv python3-pip build-essential
 cd /home/ip400
-git clone [https://github.com/sblackt/ip400_server]
+git clone https://github.com/sblackt/ip400_server.git
 cd ip400_server
 ./scripts/install_ip400.sh
 ```
